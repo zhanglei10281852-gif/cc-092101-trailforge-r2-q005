@@ -13,11 +13,16 @@ from trailforge.schemas.safety import (
     CheckInSubmit,
     EmergencyIncidentCreate,
     EmergencyIncidentResponse,
-    EmergencyIncidentUpdate,
+    HandoverConfirm,
+    IncidentStatusTransition,
+    IncidentTimelineSlice,
     OverdueCheckIn,
+    PendingHandover,
     RiskAssessmentCreate,
     RiskAssessmentResponse,
     SafetySummary,
+    TimelineEntryCreate,
+    TimelineEntryResponse,
     WeatherSnapshotCreate,
     WeatherSnapshotResponse,
 )
@@ -70,13 +75,57 @@ def record_incident(
     return SafetyService(session).record_incident(data)
 
 
-@router.patch("/incidents/{incident_id}", response_model=EmergencyIncidentResponse)
-def update_incident(
+@router.post(
+    "/incidents/{incident_id}/timeline",
+    response_model=TimelineEntryResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def append_timeline_entry(
     incident_id: int,
-    data: EmergencyIncidentUpdate,
+    data: TimelineEntryCreate,
+    session: SessionDep,
+) -> TimelineEntryResponse:
+    return SafetyService(session).append_timeline_entry(incident_id, data)
+
+
+@router.get("/incidents/{incident_id}/timeline", response_model=IncidentTimelineSlice)
+def read_timeline(
+    incident_id: int,
+    session: SessionDep,
+    after_seq: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> IncidentTimelineSlice:
+    return SafetyService(session).timeline(incident_id, after_seq=after_seq, limit=limit)
+
+
+@router.post("/incidents/{incident_id}/status", response_model=EmergencyIncidentResponse)
+def transition_incident_status(
+    incident_id: int,
+    data: IncidentStatusTransition,
     session: SessionDep,
 ) -> EmergencyIncidentResponse:
-    return SafetyService(session).update_incident(incident_id, data)
+    return SafetyService(session).transition_incident_status(incident_id, data)
+
+
+@router.post(
+    "/incidents/{incident_id}/handovers/{handover_seq}/confirm",
+    response_model=EmergencyIncidentResponse,
+)
+def confirm_handover(
+    incident_id: int,
+    handover_seq: int,
+    data: HandoverConfirm,
+    session: SessionDep,
+) -> EmergencyIncidentResponse:
+    return SafetyService(session).confirm_handover(incident_id, handover_seq, data)
+
+
+@router.get("/handovers/pending", response_model=list[PendingHandover])
+def pending_handovers(
+    session: SessionDep,
+    user_id: int = Query(gt=0),
+) -> list[PendingHandover]:
+    return SafetyService(session).pending_handovers(user_id)
 
 
 @router.post(

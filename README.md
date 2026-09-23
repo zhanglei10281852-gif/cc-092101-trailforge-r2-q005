@@ -109,6 +109,19 @@ curl -sS -X POST 'http://127.0.0.1:8000/api/v1/routes?actor_id=1' \
 
 列表接口都支持 `page`、`page_size`、`sort` 和 `direction`；各资源只接受文档中列出的排序字段，未知字段会返回明确的 422 业务错误。创建报名、打卡、紧急事件和库存变更时，正文包含 `idempotency_key`。同一作用域下用相同键和相同请求会返回原资源，用相同键发送不同请求会返回 409。
 
+## 紧急事件时间线
+
+紧急事件不再是单个可覆盖的处置文本，而是一条只追加的时间线，方便夜间值守轮班交接。创建事件时会自动写入序号 1 的观察记录，之后通过 `POST /api/v1/safety/incidents/{id}/timeline` 追加四类记录：
+
+- `observation`：现场观察；
+- `action`：处置动作；
+- `status_suggestion`：状态建议（`suggested_status` 必须是当前状态下合法的转换目标）；
+- `handover`：交接，必须指定 `handover_to_user_id`（接手人）和 `confirm_through_seq`（接手人必须确认到的时间线序号，不能超过当前最大序号）。
+
+交接规则：接手人确认前原负责人仍然有效；只有最新的未确认交接可以确认（旧序号返回 409）；只有接手人本人能确认（其他人返回 403）；已关闭事件不能再追加记录或确认交接。确认接口是 `POST /api/v1/safety/incidents/{id}/handovers/{seq}/confirm`，值守人员可以用 `GET /api/v1/safety/handovers/pending?user_id=` 查询等待自己确认的交接。
+
+事件状态由明确的转换规则推进：`open → monitoring / resolved / false_alarm`，`monitoring → resolved / false_alarm`，终态不可再变。转换走 `POST /api/v1/safety/incidents/{id}/status`；`resolved` 和 `false_alarm` 必须提供 `final_action_seq` 关联一条最终处置记录，事件的 `resolution` 取自该记录正文。时间线记录一经写入不可修改或删除（数据库触发器强制），事件内序号从 1 开始连续不重复；追加和确认都支持 `idempotency_key`，重试不会产生第二条记录。客户端用 `GET /api/v1/safety/incidents/{id}/timeline?after_seq=&limit=` 做增量读取，返回当前 `head_seq`、负责人和状态。
+
 ## 目录
 
 ```text
@@ -155,4 +168,4 @@ python -m trailforge.cli check-db
 
 每个 HTTP 请求使用独立 SQLAlchemy Session，成功时统一提交，异常时统一回滚。外键约束在每条 SQLite 连接上开启；文件数据库使用 WAL 和 busy timeout。可重试的后台写操作可使用 `Database.run_write`，它只对 SQLite busy/locked 错误做有界指数退避，不会吞掉业务冲突。
 
-训练计划、训练记录、活动、报名、装备借还、风险和签到等关键变更都会写结构化审计日志。日志包含操作者、UTC 时间、对象、动作、前后状态和必要上下文；审计工具会过滤密码、令牌、密钥等敏感字段。
+训练计划、训练记录、活动、报名、装备借还、风险、签到和紧急事件时间线等关键变更都会写结构化审计日志。日志包含操作者、UTC 时间、对象、动作、前后状态、关联时间线序号和必要上下文；审计工具会过滤密码、令牌、密钥等敏感字段。

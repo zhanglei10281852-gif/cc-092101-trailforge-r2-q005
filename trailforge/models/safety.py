@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import (
+    DDL,
     Boolean,
     CheckConstraint,
     Float,
@@ -11,11 +12,18 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
-from trailforge.database.base import Base, UTCDateTime
-from trailforge.domain.enums import CheckInType, EmergencyStatus, EmergencyType, RiskLevel
+from trailforge.database.base import Base, UTCDateTime, utc_now
+from trailforge.domain.enums import (
+    CheckInType,
+    EmergencyStatus,
+    EmergencyType,
+    RiskLevel,
+    TimelineEntryType,
+)
 from trailforge.models.mixins import IntegerPrimaryKeyMixin, TimestampMixin, VersionMixin
 
 
@@ -52,12 +60,15 @@ class EmergencyIncident(IntegerPrimaryKeyMixin, TimestampMixin, VersionMixin, Ba
         CheckConstraint(
             "longitude IS NULL OR longitude BETWEEN -180 AND 180", name="longitude_range"
         ),
+        CheckConstraint("timeline_head_seq >= 0", name="timeline_head_nonnegative"),
+        CheckConstraint("confirmed_handover_seq >= 0", name="confirmed_handover_nonnegative"),
     )
 
     expedition_id: Mapped[int] = mapped_column(
         ForeignKey("expeditions.id", ondelete="CASCADE"), index=True
     )
     reported_by: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
     incident_type: Mapped[EmergencyType] = mapped_column(String(32), nullable=False, index=True)
     risk_level: Mapped[RiskLevel] = mapped_column(String(24), nullable=False, index=True)
     status: Mapped[EmergencyStatus] = mapped_column(
@@ -68,8 +79,59 @@ class EmergencyIncident(IntegerPrimaryKeyMixin, TimestampMixin, VersionMixin, Ba
     latitude: Mapped[float | None] = mapped_column(Float)
     longitude: Mapped[float | None] = mapped_column(Float)
     description: Mapped[str] = mapped_column(Text, nullable=False)
-    actions_taken: Mapped[str] = mapped_column(Text, default="", nullable=False)
     resolution: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    timeline_head_seq: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    confirmed_handover_seq: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+
+class IncidentTimelineEntry(IntegerPrimaryKeyMixin, Base):
+    __tablename__ = "incident_timeline_entries"
+    __table_args__ = (
+        UniqueConstraint("incident_id", "seq", name="uq_incident_timeline_seq"),
+        CheckConstraint("seq >= 1", name="seq_positive"),
+        CheckConstraint(
+            "entry_type != 'handover' OR "
+            "(handover_to_user_id IS NOT NULL AND confirm_through_seq IS NOT NULL)",
+            name="handover_fields",
+        ),
+        CheckConstraint(
+            "entry_type != 'status_suggestion' OR suggested_status IS NOT NULL",
+            name="suggestion_fields",
+        ),
+    )
+
+    incident_id: Mapped[int] = mapped_column(
+        ForeignKey("emergency_incidents.id", ondelete="CASCADE"), index=True
+    )
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    entry_type: Mapped[TimelineEntryType] = mapped_column(String(24), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    actor_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    suggested_status: Mapped[EmergencyStatus | None] = mapped_column(String(24))
+    handover_to_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT")
+    )
+    confirm_through_seq: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
+
+
+_APPEND_ONLY_MESSAGE = "incident timeline entries are append-only"
+
+TIMELINE_APPEND_ONLY_TRIGGERS = (
+    DDL(
+        "CREATE TRIGGER trg_incident_timeline_no_update "
+        "BEFORE UPDATE ON incident_timeline_entries "
+        f"BEGIN SELECT RAISE(ABORT, '{_APPEND_ONLY_MESSAGE}'); END"
+    ),
+    DDL(
+        "CREATE TRIGGER trg_incident_timeline_no_delete "
+        "BEFORE DELETE ON incident_timeline_entries "
+        f"BEGIN SELECT RAISE(ABORT, '{_APPEND_ONLY_MESSAGE}'); END"
+    ),
+)
+
+for _trigger in TIMELINE_APPEND_ONLY_TRIGGERS:
+    event.listen(IncidentTimelineEntry.__table__, "after_create", _trigger)
 
 
 class RiskAssessment(IntegerPrimaryKeyMixin, TimestampMixin, Base):

@@ -7,14 +7,24 @@ from sqlalchemy.orm import Session
 
 from trailforge.database.base import utc_now
 from trailforge.domain.enums import (
+    EMERGENCY_TRANSITIONS,
+    TERMINAL_EMERGENCY_STATUSES,
     ActivityStatus,
     AuditAction,
     EmergencyStatus,
     RiskLevel,
+    TimelineEntryType,
 )
-from trailforge.errors import ConflictError, InvalidStateError, NotFoundError, ValidationError
+from trailforge.errors import (
+    ConflictError,
+    InvalidStateError,
+    NotFoundError,
+    UnauthorizedOperationError,
+    ValidationError,
+)
 from trailforge.models.safety import (
     EmergencyIncident,
+    IncidentTimelineEntry,
     ItineraryCheckIn,
     RiskAssessment,
     WeatherSnapshot,
@@ -29,11 +39,16 @@ from trailforge.schemas.safety import (
     CheckInSubmit,
     EmergencyIncidentCreate,
     EmergencyIncidentResponse,
-    EmergencyIncidentUpdate,
+    HandoverConfirm,
+    IncidentStatusTransition,
+    IncidentTimelineSlice,
     OverdueCheckIn,
+    PendingHandover,
     RiskAssessmentCreate,
     RiskAssessmentResponse,
     SafetySummary,
+    TimelineEntryCreate,
+    TimelineEntryResponse,
     WeatherSnapshotCreate,
     WeatherSnapshotResponse,
 )
@@ -161,9 +176,15 @@ class SafetyService(ServiceBase):
         if expedition.status in {ActivityStatus.COMPLETED, ActivityStatus.CANCELLED}:
             raise InvalidStateError("cannot open an incident for a closed expedition")
         incident_data = data.model_dump(exclude={"idempotency_key"})
-        incident = EmergencyIncident(**incident_data)
+        incident = EmergencyIncident(**incident_data, owner_id=data.reported_by)
         self.session.add(incident)
         self.session.flush()
+        entry = self._append_entry(
+            incident,
+            entry_type=TimelineEntryType.OBSERVATION,
+            body=data.description,
+            actor_id=data.reported_by,
+        )
         response = EmergencyIncidentResponse.model_validate(incident)
         self.save_idempotent(
             scope=scope,
@@ -179,26 +200,141 @@ class SafetyService(ServiceBase):
             entity_id=incident.id,
             action=AuditAction.EMERGENCY_RECORDED,
             after=self.snapshot(incident),
+            context={"timeline_seq": entry.seq},
             correlation_id=data.idempotency_key,
         )
         return response
 
-    def update_incident(
-        self, incident_id: int, data: EmergencyIncidentUpdate
-    ) -> EmergencyIncidentResponse:
-        incident = self.safety.get_incident(incident_id, for_update=True)
+    def append_timeline_entry(
+        self, incident_id: int, data: TimelineEntryCreate
+    ) -> TimelineEntryResponse:
+        scope = f"safety:incident:{incident_id}:timeline"
+        prior = self.find_idempotent(scope=scope, key=data.idempotency_key, payload=data)
+        if prior is not None:
+            entry = self.safety.get_timeline_entry_by_id(prior.resource_id)
+            if entry is None:
+                raise ConflictError("idempotency record references missing timeline entry")
+            return TimelineEntryResponse.model_validate(entry)
+        incident = self.safety.get_incident(incident_id)
         if incident is None:
             raise NotFoundError(f"EmergencyIncident {incident_id} was not found")
-        if incident.status in {EmergencyStatus.RESOLVED, EmergencyStatus.FALSE_ALARM}:
-            raise InvalidStateError("closed incidents cannot be modified")
+        if EmergencyStatus(incident.status) in TERMINAL_EMERGENCY_STATUSES:
+            raise InvalidStateError("closed incidents cannot accept new timeline entries")
+        self.users.require(data.actor_id)
+        if data.entry_type is TimelineEntryType.HANDOVER:
+            self.users.require(data.handover_to_user_id)
+            if data.confirm_through_seq > incident.timeline_head_seq:
+                raise ValidationError(
+                    "confirm_through_seq cannot exceed the current timeline head",
+                    context={
+                        "confirm_through_seq": data.confirm_through_seq,
+                        "head_seq": incident.timeline_head_seq,
+                    },
+                )
+        if data.entry_type is TimelineEntryType.STATUS_SUGGESTION:
+            current = EmergencyStatus(incident.status)
+            allowed = EMERGENCY_TRANSITIONS[current]
+            if data.suggested_status not in allowed:
+                raise ValidationError(
+                    "suggested status is not reachable from the current status",
+                    context={
+                        "current": current.value,
+                        "suggested": data.suggested_status,
+                        "allowed": sorted(allowed),
+                    },
+                )
+        entry = self._append_entry(
+            incident,
+            entry_type=data.entry_type,
+            body=data.body,
+            actor_id=data.actor_id,
+            suggested_status=data.suggested_status,
+            handover_to_user_id=data.handover_to_user_id,
+            confirm_through_seq=data.confirm_through_seq,
+        )
+        response = TimelineEntryResponse.model_validate(entry)
+        self.save_idempotent(
+            scope=scope,
+            key=data.idempotency_key,
+            payload=data,
+            resource_type="incident_timeline_entry",
+            resource_id=entry.id,
+            response=response.model_dump(mode="json"),
+        )
+        self.audit(
+            actor_id=data.actor_id,
+            entity_type="emergency_incident",
+            entity_id=incident.id,
+            action=AuditAction.TIMELINE_ENTRY_APPENDED,
+            after={
+                "seq": entry.seq,
+                "entry_type": entry.entry_type,
+                "body": entry.body,
+                "suggested_status": entry.suggested_status,
+                "handover_to_user_id": entry.handover_to_user_id,
+                "confirm_through_seq": entry.confirm_through_seq,
+            },
+            context={"incident_status": EmergencyStatus(incident.status).value},
+            correlation_id=data.idempotency_key,
+        )
+        return response
+
+    def transition_incident_status(
+        self, incident_id: int, data: IncidentStatusTransition
+    ) -> EmergencyIncidentResponse:
+        incident = self.safety.get_incident(incident_id)
+        if incident is None:
+            raise NotFoundError(f"EmergencyIncident {incident_id} was not found")
+        self.users.require(data.actor_id)
+        self.safety.lock_incident(incident.id)
+        self.session.expire(incident)
+        current = EmergencyStatus(incident.status)
+        target = EmergencyStatus(data.target_status)
+        allowed = EMERGENCY_TRANSITIONS[current]
+        if target not in allowed:
+            raise InvalidStateError(
+                "incident status transition is not allowed",
+                context={
+                    "current": current.value,
+                    "target": target.value,
+                    "allowed": sorted(allowed),
+                },
+            )
         apply_version(incident, data.expected_version)
-        before = self.snapshot(incident, "status", "actions_taken", "resolution")
-        incident.status = data.status
-        if data.actions_taken is not None:
-            incident.actions_taken = data.actions_taken
-        if data.resolution is not None:
-            incident.resolution = data.resolution
-        incident.resolved_at = data.resolved_at
+        final_entry: IncidentTimelineEntry | None = None
+        if target in TERMINAL_EMERGENCY_STATUSES:
+            if data.final_action_seq is None:
+                raise ValidationError(
+                    "closing an incident requires final_action_seq "
+                    "referencing a final action entry"
+                )
+            final_entry = self.safety.get_timeline_entry(incident.id, data.final_action_seq)
+            if final_entry is None:
+                raise ValidationError(
+                    "final_action_seq does not reference an existing timeline entry",
+                    context={"final_action_seq": data.final_action_seq},
+                )
+            if final_entry.entry_type != TimelineEntryType.ACTION:
+                raise ValidationError("final_action_seq must reference an action entry")
+        elif data.final_action_seq is not None:
+            raise ValidationError("final_action_seq is only allowed when closing an incident")
+        if data.suggestion_seq is not None:
+            suggestion = self.safety.get_timeline_entry(incident.id, data.suggestion_seq)
+            if suggestion is None or suggestion.entry_type != TimelineEntryType.STATUS_SUGGESTION:
+                raise ValidationError("suggestion_seq must reference a status suggestion entry")
+            if EmergencyStatus(suggestion.suggested_status) is not target:
+                raise ValidationError(
+                    "suggestion does not match the target status",
+                    context={
+                        "suggested": suggestion.suggested_status,
+                        "target": target.value,
+                    },
+                )
+        before = self.snapshot(incident, "status", "resolution", "resolved_at", "owner_id")
+        incident.status = target
+        if final_entry is not None:
+            incident.resolution = final_entry.body
+            incident.resolved_at = utc_now()
         self.session.flush()
         self.audit(
             actor_id=data.actor_id,
@@ -206,9 +342,142 @@ class SafetyService(ServiceBase):
             entity_id=incident.id,
             action=AuditAction.STATUS_CHANGED,
             before=before,
-            after=self.snapshot(incident, "status", "actions_taken", "resolution"),
+            after=self.snapshot(incident, "status", "resolution", "resolved_at", "owner_id"),
+            context={
+                "final_action_seq": data.final_action_seq,
+                "suggestion_seq": data.suggestion_seq,
+                "reason": data.reason,
+            },
         )
         return EmergencyIncidentResponse.model_validate(incident)
+
+    def confirm_handover(
+        self, incident_id: int, handover_seq: int, data: HandoverConfirm
+    ) -> EmergencyIncidentResponse:
+        scope = f"safety:incident:{incident_id}:handover:{handover_seq}:confirm"
+        prior = self.find_idempotent(scope=scope, key=data.idempotency_key, payload=data)
+        if prior is not None:
+            incident = self.safety.get_incident(prior.resource_id)
+            if incident is None:
+                raise ConflictError("idempotency record references missing incident")
+            return EmergencyIncidentResponse.model_validate(incident)
+        incident = self.safety.get_incident(incident_id)
+        if incident is None:
+            raise NotFoundError(f"EmergencyIncident {incident_id} was not found")
+        self.safety.lock_incident(incident.id)
+        self.session.expire(incident)
+        if EmergencyStatus(incident.status) in TERMINAL_EMERGENCY_STATUSES:
+            raise InvalidStateError("closed incidents cannot confirm handovers")
+        entry = self.safety.get_timeline_entry(incident.id, handover_seq)
+        if entry is None:
+            raise NotFoundError(
+                f"timeline entry {handover_seq} was not found on incident {incident_id}"
+            )
+        if entry.entry_type != TimelineEntryType.HANDOVER:
+            raise ValidationError("only handover entries can be confirmed")
+        latest = self.safety.latest_handover(incident.id)
+        if (
+            latest is None
+            or entry.seq != latest.seq
+            or entry.seq <= incident.confirmed_handover_seq
+        ):
+            raise ConflictError(
+                "only the latest unconfirmed handover can be confirmed",
+                context={
+                    "handover_seq": handover_seq,
+                    "latest_handover_seq": latest.seq if latest else None,
+                    "confirmed_handover_seq": incident.confirmed_handover_seq,
+                },
+            )
+        if data.actor_id != entry.handover_to_user_id:
+            raise UnauthorizedOperationError(
+                "only the designated receiver can confirm the handover"
+            )
+        before = self.snapshot(incident, "owner_id", "confirmed_handover_seq", "status")
+        incident.owner_id = entry.handover_to_user_id
+        incident.confirmed_handover_seq = entry.seq
+        apply_version(incident, None)
+        self.session.flush()
+        response = EmergencyIncidentResponse.model_validate(incident)
+        self.save_idempotent(
+            scope=scope,
+            key=data.idempotency_key,
+            payload=data,
+            resource_type="emergency_incident",
+            resource_id=incident.id,
+            response=response.model_dump(mode="json"),
+        )
+        self.audit(
+            actor_id=data.actor_id,
+            entity_type="emergency_incident",
+            entity_id=incident.id,
+            action=AuditAction.HANDOVER_CONFIRMED,
+            before=before,
+            after=self.snapshot(incident, "owner_id", "confirmed_handover_seq", "status"),
+            context={
+                "handover_seq": entry.seq,
+                "confirm_through_seq": entry.confirm_through_seq,
+            },
+            correlation_id=data.idempotency_key,
+        )
+        return response
+
+    def timeline(
+        self, incident_id: int, *, after_seq: int = 0, limit: int | None = None
+    ) -> IncidentTimelineSlice:
+        incident = self.safety.get_incident(incident_id)
+        if incident is None:
+            raise NotFoundError(f"EmergencyIncident {incident_id} was not found")
+        entries = self.safety.timeline_entries(incident_id, after_seq=after_seq, limit=limit)
+        return IncidentTimelineSlice(
+            incident_id=incident.id,
+            status=EmergencyStatus(incident.status),
+            owner_id=incident.owner_id,
+            head_seq=incident.timeline_head_seq,
+            items=[TimelineEntryResponse.model_validate(entry) for entry in entries],
+        )
+
+    def pending_handovers(self, user_id: int) -> list[PendingHandover]:
+        self.users.require(user_id)
+        results: list[PendingHandover] = []
+        for entry, incident in self.safety.pending_handovers(user_id):
+            results.append(
+                PendingHandover(
+                    incident_id=incident.id,
+                    expedition_id=incident.expedition_id,
+                    handover_seq=entry.seq,
+                    confirm_through_seq=entry.confirm_through_seq,
+                    handover_from_actor_id=entry.actor_id,
+                    current_owner_id=incident.owner_id,
+                    requested_at=entry.created_at,
+                )
+            )
+        return results
+
+    def _append_entry(
+        self,
+        incident: EmergencyIncident,
+        *,
+        entry_type: TimelineEntryType,
+        body: str,
+        actor_id: int,
+        suggested_status: EmergencyStatus | None = None,
+        handover_to_user_id: int | None = None,
+        confirm_through_seq: int | None = None,
+    ) -> IncidentTimelineEntry:
+        seq = self.safety.allocate_timeline_seq(incident.id)
+        self.session.expire(incident, ["timeline_head_seq"])
+        entry = IncidentTimelineEntry(
+            incident_id=incident.id,
+            seq=seq,
+            entry_type=entry_type,
+            body=body,
+            actor_id=actor_id,
+            suggested_status=suggested_status,
+            handover_to_user_id=handover_to_user_id,
+            confirm_through_seq=confirm_through_seq,
+        )
+        return self.safety.add_timeline_entry(entry)
 
     def assess_risk(self, data: RiskAssessmentCreate) -> RiskAssessmentResponse:
         if self.expeditions.get(data.expedition_id) is None:

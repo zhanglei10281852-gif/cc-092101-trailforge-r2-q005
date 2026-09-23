@@ -4,8 +4,15 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from trailforge.domain.enums import CheckInType, EmergencyStatus, EmergencyType, RiskLevel
+from trailforge.domain.enums import (
+    CheckInType,
+    EmergencyStatus,
+    EmergencyType,
+    RiskLevel,
+    TimelineEntryType,
+)
 from trailforge.schemas.common import (
+    ORMModel,
     TimestampedResponse,
     VersionedResponse,
     clean_text,
@@ -78,7 +85,6 @@ class EmergencyIncidentCreate(BaseModel):
     latitude: float | None = Field(default=None, ge=-90, le=90)
     longitude: float | None = Field(default=None, ge=-180, le=180)
     description: str = Field(min_length=1, max_length=10000)
-    actions_taken: str = Field(default="", max_length=10000)
     idempotency_key: str = Field(min_length=8, max_length=160)
 
     @field_validator("occurred_at")
@@ -98,32 +104,10 @@ class EmergencyIncidentCreate(BaseModel):
         return self
 
 
-class EmergencyIncidentUpdate(BaseModel):
-    status: EmergencyStatus
-    actions_taken: str | None = Field(default=None, max_length=10000)
-    resolution: str | None = Field(default=None, max_length=10000)
-    resolved_at: datetime | None = None
-    actor_id: int = Field(gt=0)
-    expected_version: int | None = Field(default=None, ge=1)
-
-    @field_validator("resolved_at")
-    @classmethod
-    def normalize_time(cls, value: datetime | None) -> datetime | None:
-        return require_aware(value) if value is not None else None
-
-    @model_validator(mode="after")
-    def validate_resolution(self) -> EmergencyIncidentUpdate:
-        closed = {EmergencyStatus.RESOLVED, EmergencyStatus.FALSE_ALARM}
-        if self.status in closed and not (self.resolution or "").strip():
-            raise ValueError("closed incidents require a resolution")
-        if self.status in closed and self.resolved_at is None:
-            raise ValueError("closed incidents require resolved_at")
-        return self
-
-
 class EmergencyIncidentResponse(VersionedResponse):
     expedition_id: int
     reported_by: int
+    owner_id: int
     incident_type: EmergencyType
     risk_level: RiskLevel
     status: EmergencyStatus
@@ -132,8 +116,91 @@ class EmergencyIncidentResponse(VersionedResponse):
     latitude: float | None
     longitude: float | None
     description: str
-    actions_taken: str
     resolution: str
+    timeline_head_seq: int
+    confirmed_handover_seq: int
+
+
+class TimelineEntryCreate(BaseModel):
+    entry_type: TimelineEntryType
+    body: str = Field(min_length=1, max_length=10000)
+    actor_id: int = Field(gt=0)
+    suggested_status: EmergencyStatus | None = None
+    handover_to_user_id: int | None = Field(default=None, gt=0)
+    confirm_through_seq: int | None = Field(default=None, ge=1)
+    idempotency_key: str = Field(min_length=8, max_length=160)
+
+    @field_validator("body")
+    @classmethod
+    def normalize_body(cls, value: str) -> str:
+        return clean_text(value)
+
+    @model_validator(mode="after")
+    def type_specific_fields(self) -> TimelineEntryCreate:
+        if self.entry_type is TimelineEntryType.HANDOVER:
+            if self.handover_to_user_id is None or self.confirm_through_seq is None:
+                raise ValueError(
+                    "handover entries require handover_to_user_id and confirm_through_seq"
+                )
+            if self.suggested_status is not None:
+                raise ValueError("handover entries cannot carry a suggested_status")
+        elif self.entry_type is TimelineEntryType.STATUS_SUGGESTION:
+            if self.suggested_status is None:
+                raise ValueError("status suggestion entries require suggested_status")
+            if self.handover_to_user_id is not None or self.confirm_through_seq is not None:
+                raise ValueError("status suggestion entries cannot carry handover fields")
+        elif (
+            self.suggested_status is not None
+            or self.handover_to_user_id is not None
+            or self.confirm_through_seq is not None
+        ):
+            raise ValueError("observation and action entries only carry a body")
+        return self
+
+
+class TimelineEntryResponse(ORMModel):
+    id: int
+    incident_id: int
+    seq: int
+    entry_type: TimelineEntryType
+    body: str
+    actor_id: int
+    suggested_status: EmergencyStatus | None
+    handover_to_user_id: int | None
+    confirm_through_seq: int | None
+    created_at: datetime
+
+
+class IncidentTimelineSlice(BaseModel):
+    incident_id: int
+    status: EmergencyStatus
+    owner_id: int
+    head_seq: int
+    items: list[TimelineEntryResponse]
+
+
+class IncidentStatusTransition(BaseModel):
+    target_status: EmergencyStatus
+    actor_id: int = Field(gt=0)
+    final_action_seq: int | None = Field(default=None, ge=1)
+    suggestion_seq: int | None = Field(default=None, ge=1)
+    expected_version: int | None = Field(default=None, ge=1)
+    reason: str = Field(default="", max_length=2000)
+
+
+class HandoverConfirm(BaseModel):
+    actor_id: int = Field(gt=0)
+    idempotency_key: str = Field(min_length=8, max_length=160)
+
+
+class PendingHandover(BaseModel):
+    incident_id: int
+    expedition_id: int
+    handover_seq: int
+    confirm_through_seq: int
+    handover_from_actor_id: int
+    current_owner_id: int
+    requested_at: datetime
 
 
 class RiskAssessmentCreate(BaseModel):

@@ -23,8 +23,9 @@ from trailforge.schemas.safety import (
     CheckInScheduleCreate,
     CheckInSubmit,
     EmergencyIncidentCreate,
-    EmergencyIncidentUpdate,
+    IncidentStatusTransition,
     RiskAssessmentCreate,
+    TimelineEntryCreate,
     WeatherSnapshotCreate,
 )
 from trailforge.services.gear import GearService
@@ -310,7 +311,7 @@ def test_risk_assessment_computes_score_and_level(session) -> None:
     assert assessment.risk_level == RiskLevel.CRITICAL
 
 
-def test_incident_requires_resolution_when_closed(session) -> None:
+def test_incident_close_links_final_action_entry(session) -> None:
     organizer, _, expedition = _expedition(session)
     service = SafetyService(session)
     now = datetime.now(UTC)
@@ -325,18 +326,26 @@ def test_incident_requires_resolution_when_closed(session) -> None:
             idempotency_key="ankle-incident",
         )
     )
-    updated = service.update_incident(
+    action = service.append_timeline_entry(
         incident.id,
-        EmergencyIncidentUpdate(
-            status="resolved",
-            actions_taken="Rested and evaluated",
-            resolution="Participant walked out safely",
-            resolved_at=now + timedelta(hours=1),
+        TimelineEntryCreate(
+            entry_type="action",
+            body="Participant walked out safely",
             actor_id=organizer,
+            idempotency_key="ankle-final-action",
         ),
     )
-    assert updated.status == "resolved"
-    assert updated.resolution == "Participant walked out safely"
+    closed = service.transition_incident_status(
+        incident.id,
+        IncidentStatusTransition(
+            target_status="resolved",
+            actor_id=organizer,
+            final_action_seq=action.seq,
+        ),
+    )
+    assert closed.status == "resolved"
+    assert closed.resolution == "Participant walked out safely"
+    assert closed.resolved_at is not None
 
 
 def test_weather_snapshot_is_explicitly_offline_and_in_summary(session) -> None:
