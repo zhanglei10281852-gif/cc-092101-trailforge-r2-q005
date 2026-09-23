@@ -16,7 +16,12 @@ class Migration:
 
 MIGRATIONS = [
     Migration(version="0001", description="Initial TrailForge schema"),
+    Migration(version="0002", description="Append-only incident timeline guards"),
 ]
+
+# Incident timelines are legal records of the night shift: nobody may rewrite or
+# remove history, so the database itself rejects UPDATE and DELETE on these tables.
+APPEND_ONLY_TABLES = ("incident_timeline_entries", "handover_confirmations")
 
 
 def initialize_database(database: Database) -> list[str]:
@@ -37,7 +42,31 @@ def initialize_database(database: Database) -> list[str]:
                 )
             )
             applied.append(migration.version)
+    _install_append_only_guards(database)
     return applied
+
+
+def _install_append_only_guards(database: Database) -> None:
+    with database.engine.begin() as connection:
+        for table in APPEND_ONLY_TABLES:
+            connection.exec_driver_sql(
+                f"""
+                CREATE TRIGGER IF NOT EXISTS trg_{table}_reject_update
+                BEFORE UPDATE ON {table}
+                BEGIN
+                    SELECT RAISE(ABORT, '{table} is append-only');
+                END
+                """
+            )
+            connection.exec_driver_sql(
+                f"""
+                CREATE TRIGGER IF NOT EXISTS trg_{table}_reject_delete
+                BEFORE DELETE ON {table}
+                BEGIN
+                    SELECT RAISE(ABORT, '{table} is append-only');
+                END
+                """
+            )
 
 
 def migration_status(database: Database) -> dict[str, object]:

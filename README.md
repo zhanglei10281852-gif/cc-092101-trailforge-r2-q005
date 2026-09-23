@@ -109,6 +109,39 @@ curl -sS -X POST 'http://127.0.0.1:8000/api/v1/routes?actor_id=1' \
 
 列表接口都支持 `page`、`page_size`、`sort` 和 `direction`；各资源只接受文档中列出的排序字段，未知字段会返回明确的 422 业务错误。创建报名、打卡、紧急事件和库存变更时，正文包含 `idempotency_key`。同一作用域下用相同键和相同请求会返回原资源，用相同键发送不同请求会返回 409。
 
+## 紧急事件时间线与轮班交接
+
+紧急事件不再用单个可覆盖的处置文本，而是只追加（append-only）的时间线，便于值守轮班时看清"谁在什么时候确认到了哪一步"：
+
+- 四类记录：`observation`（观察）、`action`（处置）、`status_suggestion`（状态建议）、`handover`（交接）。
+- 每个事件内部序号从 1 开始连续不重复，并发追加由唯一约束和保存点重试保证；时间线记录和交接确认在数据库触发器层面禁止 UPDATE/DELETE。
+- 交接由当前有效负责人发起，必须指定接手人；`required_through_seq` 固定为交接条目自身序号。接手人确认前原负责人仍然有效；确认必须显式确认到时间线当前最新序号，旧序号无法确认。
+- 已关闭（`resolved`/`false_alarm`）的事件不能再追加记录或确认交接。状态只能按明确规则推进：`open ↔ monitoring`，两者可进入 `resolved` 或 `false_alarm`（终态）。解决和误报都必须关联同事件的一条 `action` 最终处置记录并给出 `resolved_at`。
+- `GET .../timeline?after_seq=&limit=` 支持增量拉取；`GET /safety/handovers/pending?user_id=` 返回该用户的交接待办（自动排除已关闭事件）。
+- 每次追加、确认、状态转换都写结构化审计：操作者、前后状态、交接序号、关联的最终处置条目序号和幂等键。
+
+```bash
+# 追加观察 / 处置 / 状态建议
+curl -sS -X POST http://127.0.0.1:8000/api/v1/safety/incidents/1/timeline/actions \
+  -H 'Content-Type: application/json' \
+  -d '{"author_id":7,"content":"已联系救援并清点人数","idempotency_key":"act-20260923-01"}'
+
+# 当前负责人发起交接（接手人 9 必须确认到最新序号）
+curl -sS -X POST http://127.0.0.1:8000/api/v1/safety/incidents/1/timeline/handovers \
+  -H 'Content-Type: application/json' \
+  -d '{"author_id":7,"content":"02:00 交班，情况稳定","successor_id":9,"idempotency_key":"hand-20260923-02"}'
+
+# 接手人增量阅读后确认；confirm_through_seq 必须等于当前最新序号
+curl -sS -X POST http://127.0.0.1:8000/api/v1/safety/incidents/1/handovers/4/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"successor_id":9,"confirm_through_seq":4,"idempotency_key":"confirm-20260923-03"}'
+
+# 关闭事件必须关联一条 action 记录
+curl -sS -X POST http://127.0.0.1:8000/api/v1/safety/incidents/1/transitions \
+  -H 'Content-Type: application/json' \
+  -d '{"actor_id":9,"target_status":"resolved","final_action_entry_id":2,"resolved_at":"2026-09-23T03:10:00+00:00","idempotency_key":"close-20260923-04"}'
+```
+
 ## 目录
 
 ```text
@@ -155,4 +188,4 @@ python -m trailforge.cli check-db
 
 每个 HTTP 请求使用独立 SQLAlchemy Session，成功时统一提交，异常时统一回滚。外键约束在每条 SQLite 连接上开启；文件数据库使用 WAL 和 busy timeout。可重试的后台写操作可使用 `Database.run_write`，它只对 SQLite busy/locked 错误做有界指数退避，不会吞掉业务冲突。
 
-训练计划、训练记录、活动、报名、装备借还、风险和签到等关键变更都会写结构化审计日志。日志包含操作者、UTC 时间、对象、动作、前后状态和必要上下文；审计工具会过滤密码、令牌、密钥等敏感字段。
+训练计划、训练记录、活动、报名、装备借还、风险和签到等关键变更都会写结构化审计日志。日志包含操作者、UTC 时间、对象、动作、前后状态和必要上下文（如紧急事件时间线序号、交接双方、关联的最终处置条目）；审计工具会过滤密码、令牌、密钥等敏感字段。

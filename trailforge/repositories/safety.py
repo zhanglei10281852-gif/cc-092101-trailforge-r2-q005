@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from trailforge.domain.enums import EmergencyStatus
 from trailforge.models.safety import (
+    ActiveHandover,
     EmergencyIncident,
+    HandoverConfirmation,
+    IncidentTimelineEntry,
     ItineraryCheckIn,
     RiskAssessment,
     WeatherSnapshot,
@@ -93,3 +96,87 @@ class SafetyRepository(BaseRepository[ItineraryCheckIn]):
             .limit(1)
         )
         return self.session.scalar(statement)
+
+    def max_timeline_seq(self, incident_id: int) -> int:
+        statement = select(func.coalesce(func.max(IncidentTimelineEntry.seq), 0)).where(
+            IncidentTimelineEntry.incident_id == incident_id
+        )
+        return int(self.session.scalar(statement) or 0)
+
+    def get_timeline_entry(self, entry_id: int) -> IncidentTimelineEntry | None:
+        return self.session.get(IncidentTimelineEntry, entry_id)
+
+    def timeline_entries(
+        self, incident_id: int, *, after_seq: int = 0, limit: int | None = None
+    ) -> list[IncidentTimelineEntry]:
+        statement = (
+            select(IncidentTimelineEntry)
+            .where(
+                IncidentTimelineEntry.incident_id == incident_id,
+                IncidentTimelineEntry.seq > after_seq,
+            )
+            .order_by(IncidentTimelineEntry.seq)
+        )
+        if limit is not None:
+            statement = statement.limit(limit)
+        return list(self.session.scalars(statement))
+
+    def get_confirmation(self, handover_entry_id: int) -> HandoverConfirmation | None:
+        return self.session.scalar(
+            select(HandoverConfirmation).where(
+                HandoverConfirmation.handover_entry_id == handover_entry_id
+            )
+        )
+
+    def confirmations_for_entries(
+        self, entry_ids: list[int]
+    ) -> dict[int, HandoverConfirmation]:
+        if not entry_ids:
+            return {}
+        statement = select(HandoverConfirmation).where(
+            HandoverConfirmation.handover_entry_id.in_(entry_ids)
+        )
+        return {
+            confirmation.handover_entry_id: confirmation
+            for confirmation in self.session.scalars(statement)
+        }
+
+    def latest_confirmed_handover(self, incident_id: int) -> IncidentTimelineEntry | None:
+        statement = (
+            select(IncidentTimelineEntry)
+            .join(
+                HandoverConfirmation,
+                HandoverConfirmation.handover_entry_id == IncidentTimelineEntry.id,
+            )
+            .where(IncidentTimelineEntry.incident_id == incident_id)
+            .order_by(IncidentTimelineEntry.seq.desc())
+            .limit(1)
+        )
+        return self.session.scalar(statement)
+
+    def get_active_handover(self, incident_id: int) -> ActiveHandover | None:
+        return self.session.get(ActiveHandover, incident_id)
+
+    def pending_handover(self, incident_id: int) -> IncidentTimelineEntry | None:
+        active = self.get_active_handover(incident_id)
+        if active is None:
+            return None
+        return self.get_timeline_entry(active.entry_id)
+
+    def pending_handovers_for(self, successor_id: int) -> list[IncidentTimelineEntry]:
+        statement = (
+            select(IncidentTimelineEntry)
+            .join(ActiveHandover, ActiveHandover.entry_id == IncidentTimelineEntry.id)
+            .join(
+                EmergencyIncident,
+                EmergencyIncident.id == IncidentTimelineEntry.incident_id,
+            )
+            .where(
+                ActiveHandover.successor_id == successor_id,
+                EmergencyIncident.status.notin_(
+                    [EmergencyStatus.RESOLVED.value, EmergencyStatus.FALSE_ALARM.value]
+                ),
+            )
+            .order_by(IncidentTimelineEntry.created_at)
+        )
+        return list(self.session.scalars(statement))

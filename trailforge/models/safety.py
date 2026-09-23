@@ -7,6 +7,7 @@ from sqlalchemy import (
     CheckConstraint,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -15,7 +16,13 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column
 
 from trailforge.database.base import Base, UTCDateTime
-from trailforge.domain.enums import CheckInType, EmergencyStatus, EmergencyType, RiskLevel
+from trailforge.domain.enums import (
+    CheckInType,
+    EmergencyStatus,
+    EmergencyType,
+    IncidentEntryKind,
+    RiskLevel,
+)
 from trailforge.models.mixins import IntegerPrimaryKeyMixin, TimestampMixin, VersionMixin
 
 
@@ -68,8 +75,83 @@ class EmergencyIncident(IntegerPrimaryKeyMixin, TimestampMixin, VersionMixin, Ba
     latitude: Mapped[float | None] = mapped_column(Float)
     longitude: Mapped[float | None] = mapped_column(Float)
     description: Mapped[str] = mapped_column(Text, nullable=False)
-    actions_taken: Mapped[str] = mapped_column(Text, default="", nullable=False)
-    resolution: Mapped[str] = mapped_column(Text, default="", nullable=False)
+
+
+class IncidentTimelineEntry(IntegerPrimaryKeyMixin, TimestampMixin, Base):
+    """Append-only timeline record for an emergency incident.
+
+    Rows are never updated or deleted (enforced by database triggers); history is
+    preserved so the next shift can see exactly what happened and who confirmed it.
+    """
+
+    __tablename__ = "incident_timeline_entries"
+    __table_args__ = (
+        UniqueConstraint("incident_id", "seq", name="uq_timeline_incident_seq"),
+        CheckConstraint("seq >= 1", name="seq_positive"),
+        CheckConstraint(
+            "kind != 'handover' OR (successor_id IS NOT NULL AND required_through_seq IS NOT NULL)",
+            name="handover_fields",
+        ),
+        Index("ix_timeline_incident_seq", "incident_id", "seq"),
+    )
+
+    incident_id: Mapped[int] = mapped_column(
+        ForeignKey("emergency_incidents.id", ondelete="CASCADE"), index=True
+    )
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    kind: Mapped[IncidentEntryKind] = mapped_column(String(24), nullable=False)
+    author_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    suggested_status: Mapped[EmergencyStatus | None] = mapped_column(String(24))
+    successor_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT")
+    )
+    required_through_seq: Mapped[int | None] = mapped_column(Integer)
+
+
+class ActiveHandover(TimestampMixin, Base):
+    """Mutable pointer to the single unconfirmed handover of an incident.
+
+    This is derived state, not history: the authoritative record stays in the
+    append-only timeline. A row exists only while a handover awaits confirmation;
+    its primary key on incident_id hard-blocks two pending handovers even under
+    concurrent requests, and it is removed once the handover is confirmed or the
+    incident is closed.
+    """
+
+    __tablename__ = "active_handovers"
+
+    incident_id: Mapped[int] = mapped_column(
+        ForeignKey("emergency_incidents.id", ondelete="CASCADE"), primary_key=True
+    )
+    entry_id: Mapped[int] = mapped_column(
+        ForeignKey("incident_timeline_entries.id", ondelete="CASCADE"),
+        unique=True,
+        nullable=False,
+    )
+    successor_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+
+
+class HandoverConfirmation(IntegerPrimaryKeyMixin, TimestampMixin, Base):
+    """Append-only record that a handover successor accepted responsibility.
+
+    Kept in a separate table so the timeline itself stays strictly insert-only.
+    """
+
+    __tablename__ = "handover_confirmations"
+
+    handover_entry_id: Mapped[int] = mapped_column(
+        ForeignKey("incident_timeline_entries.id", ondelete="CASCADE"),
+        unique=True,
+        nullable=False,
+    )
+    incident_id: Mapped[int] = mapped_column(
+        ForeignKey("emergency_incidents.id", ondelete="CASCADE"), index=True
+    )
+    confirmed_by: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    confirmed_through_seq: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
 class RiskAssessment(IntegerPrimaryKeyMixin, TimestampMixin, Base):

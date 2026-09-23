@@ -23,7 +23,8 @@ from trailforge.schemas.safety import (
     CheckInScheduleCreate,
     CheckInSubmit,
     EmergencyIncidentCreate,
-    EmergencyIncidentUpdate,
+    IncidentEntryAppend,
+    IncidentTransition,
     RiskAssessmentCreate,
     WeatherSnapshotCreate,
 )
@@ -310,7 +311,7 @@ def test_risk_assessment_computes_score_and_level(session) -> None:
     assert assessment.risk_level == RiskLevel.CRITICAL
 
 
-def test_incident_requires_resolution_when_closed(session) -> None:
+def test_incident_requires_final_action_when_closed(session) -> None:
     organizer, _, expedition = _expedition(session)
     service = SafetyService(session)
     now = datetime.now(UTC)
@@ -325,18 +326,36 @@ def test_incident_requires_resolution_when_closed(session) -> None:
             idempotency_key="ankle-incident",
         )
     )
-    updated = service.update_incident(
+    with pytest.raises(Exception, match="final action"):
+        service.transition_incident(
+            incident.id,
+            IncidentTransition(
+                actor_id=organizer,
+                target_status="resolved",
+                resolved_at=now + timedelta(hours=1),
+                idempotency_key="close-without-action",
+            ),
+        )
+    final_action = service.append_action(
         incident.id,
-        EmergencyIncidentUpdate(
-            status="resolved",
-            actions_taken="Rested and evaluated",
-            resolution="Participant walked out safely",
-            resolved_at=now + timedelta(hours=1),
+        IncidentEntryAppend(
+            author_id=organizer,
+            content="Rested and evaluated; participant walked out safely",
+            idempotency_key="final-handling",
+        ),
+    )
+    updated = service.transition_incident(
+        incident.id,
+        IncidentTransition(
             actor_id=organizer,
+            target_status="resolved",
+            final_action_entry_id=final_action.id,
+            resolved_at=now + timedelta(hours=1),
+            idempotency_key="resolve-incident",
         ),
     )
     assert updated.status == "resolved"
-    assert updated.resolution == "Participant walked out safely"
+    assert updated.resolved_at is not None
 
 
 def test_weather_snapshot_is_explicitly_offline_and_in_summary(session) -> None:

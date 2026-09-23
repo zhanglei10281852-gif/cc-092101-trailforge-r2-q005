@@ -139,6 +139,13 @@ class EmergencyType(StrEnum):
     OTHER = "other"
 
 
+class IncidentEntryKind(StrEnum):
+    OBSERVATION = "observation"
+    ACTION = "action"
+    STATUS_SUGGESTION = "status_suggestion"
+    HANDOVER = "handover"
+
+
 class InventoryMovementType(StrEnum):
     INITIAL = "initial"
     ACQUIRE = "acquire"
@@ -160,6 +167,8 @@ class AuditAction(StrEnum):
     RETURNED = "returned"
     RISK_RECORDED = "risk_recorded"
     EMERGENCY_RECORDED = "emergency_recorded"
+    TIMELINE_APPENDED = "timeline_appended"
+    HANDOVER_CONFIRMED = "handover_confirmed"
 
 
 PLAN_TRANSITIONS: dict[PlanStatus, set[PlanStatus]] = {
@@ -193,3 +202,25 @@ ACTIVITY_TRANSITIONS: dict[ActivityStatus, set[ActivityStatus]] = {
     ActivityStatus.COMPLETED: set(),
     ActivityStatus.CANCELLED: set(),
 }
+
+
+# Emergency incidents advance only through these explicit transitions. Resolved and
+# false_alarm are terminal and additionally require a final action timeline entry.
+INCIDENT_TRANSITIONS: dict[EmergencyStatus, set[EmergencyStatus]] = {
+    EmergencyStatus.OPEN: {
+        EmergencyStatus.MONITORING,
+        EmergencyStatus.RESOLVED,
+        EmergencyStatus.FALSE_ALARM,
+    },
+    EmergencyStatus.MONITORING: {
+        EmergencyStatus.OPEN,
+        EmergencyStatus.RESOLVED,
+        EmergencyStatus.FALSE_ALARM,
+    },
+    EmergencyStatus.RESOLVED: set(),
+    EmergencyStatus.FALSE_ALARM: set(),
+}
+
+TERMINAL_INCIDENT_STATUSES: frozenset[EmergencyStatus] = frozenset(
+    {EmergencyStatus.RESOLVED, EmergencyStatus.FALSE_ALARM}
+)

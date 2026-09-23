@@ -4,7 +4,13 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from trailforge.domain.enums import CheckInType, EmergencyStatus, EmergencyType, RiskLevel
+from trailforge.domain.enums import (
+    CheckInType,
+    EmergencyStatus,
+    EmergencyType,
+    IncidentEntryKind,
+    RiskLevel,
+)
 from trailforge.schemas.common import (
     TimestampedResponse,
     VersionedResponse,
@@ -78,7 +84,6 @@ class EmergencyIncidentCreate(BaseModel):
     latitude: float | None = Field(default=None, ge=-90, le=90)
     longitude: float | None = Field(default=None, ge=-180, le=180)
     description: str = Field(min_length=1, max_length=10000)
-    actions_taken: str = Field(default="", max_length=10000)
     idempotency_key: str = Field(min_length=8, max_length=160)
 
     @field_validator("occurred_at")
@@ -98,27 +103,81 @@ class EmergencyIncidentCreate(BaseModel):
         return self
 
 
-class EmergencyIncidentUpdate(BaseModel):
-    status: EmergencyStatus
-    actions_taken: str | None = Field(default=None, max_length=10000)
-    resolution: str | None = Field(default=None, max_length=10000)
-    resolved_at: datetime | None = None
+class IncidentEntryAppend(BaseModel):
+    author_id: int = Field(gt=0)
+    content: str = Field(min_length=1, max_length=10000)
+    idempotency_key: str = Field(min_length=8, max_length=160)
+
+    @field_validator("content")
+    @classmethod
+    def normalize_content(cls, value: str) -> str:
+        return clean_text(value)
+
+
+class StatusSuggestionAppend(IncidentEntryAppend):
+    suggested_status: EmergencyStatus
+
+
+class HandoverAppend(IncidentEntryAppend):
+    successor_id: int = Field(gt=0)
+
+
+class HandoverConfirm(BaseModel):
+    successor_id: int = Field(gt=0)
+    confirm_through_seq: int = Field(ge=1)
+    idempotency_key: str = Field(min_length=8, max_length=160)
+
+
+class IncidentTransition(BaseModel):
     actor_id: int = Field(gt=0)
+    target_status: EmergencyStatus
+    final_action_entry_id: int | None = Field(default=None, gt=0)
+    resolved_at: datetime | None = None
     expected_version: int | None = Field(default=None, ge=1)
+    idempotency_key: str = Field(min_length=8, max_length=160)
 
     @field_validator("resolved_at")
     @classmethod
     def normalize_time(cls, value: datetime | None) -> datetime | None:
         return require_aware(value) if value is not None else None
 
-    @model_validator(mode="after")
-    def validate_resolution(self) -> EmergencyIncidentUpdate:
-        closed = {EmergencyStatus.RESOLVED, EmergencyStatus.FALSE_ALARM}
-        if self.status in closed and not (self.resolution or "").strip():
-            raise ValueError("closed incidents require a resolution")
-        if self.status in closed and self.resolved_at is None:
-            raise ValueError("closed incidents require resolved_at")
-        return self
+
+class HandoverConfirmationResponse(TimestampedResponse):
+    handover_entry_id: int
+    incident_id: int
+    confirmed_by: int
+    confirmed_through_seq: int
+
+
+class IncidentTimelineEntryResponse(TimestampedResponse):
+    incident_id: int
+    seq: int
+    kind: IncidentEntryKind
+    author_id: int
+    content: str
+    suggested_status: EmergencyStatus | None
+    successor_id: int | None
+    required_through_seq: int | None
+    handover_confirmation: HandoverConfirmationResponse | None
+
+
+class IncidentTimelinePage(BaseModel):
+    incident_id: int
+    entries: list[IncidentTimelineEntryResponse]
+    next_after_seq: int
+    has_more: bool
+
+
+class HandoverTodoItem(BaseModel):
+    incident_id: int
+    expedition_id: int
+    entry_id: int
+    entry_seq: int
+    required_through_seq: int
+    current_head_seq: int
+    from_owner_id: int
+    successor_id: int
+    created_at: datetime
 
 
 class EmergencyIncidentResponse(VersionedResponse):
@@ -132,8 +191,6 @@ class EmergencyIncidentResponse(VersionedResponse):
     latitude: float | None
     longitude: float | None
     description: str
-    actions_taken: str
-    resolution: str
 
 
 class RiskAssessmentCreate(BaseModel):

@@ -13,11 +13,19 @@ from trailforge.schemas.safety import (
     CheckInSubmit,
     EmergencyIncidentCreate,
     EmergencyIncidentResponse,
-    EmergencyIncidentUpdate,
+    HandoverAppend,
+    HandoverConfirm,
+    HandoverConfirmationResponse,
+    HandoverTodoItem,
+    IncidentEntryAppend,
+    IncidentTimelineEntryResponse,
+    IncidentTimelinePage,
+    IncidentTransition,
     OverdueCheckIn,
     RiskAssessmentCreate,
     RiskAssessmentResponse,
     SafetySummary,
+    StatusSuggestionAppend,
     WeatherSnapshotCreate,
     WeatherSnapshotResponse,
 )
@@ -70,13 +78,97 @@ def record_incident(
     return SafetyService(session).record_incident(data)
 
 
-@router.patch("/incidents/{incident_id}", response_model=EmergencyIncidentResponse)
-def update_incident(
+@router.post(
+    "/incidents/{incident_id}/timeline/observations",
+    response_model=IncidentTimelineEntryResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def append_observation(
     incident_id: int,
-    data: EmergencyIncidentUpdate,
+    data: IncidentEntryAppend,
+    session: SessionDep,
+) -> IncidentTimelineEntryResponse:
+    return SafetyService(session).append_observation(incident_id, data)
+
+
+@router.post(
+    "/incidents/{incident_id}/timeline/actions",
+    response_model=IncidentTimelineEntryResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def append_action(
+    incident_id: int,
+    data: IncidentEntryAppend,
+    session: SessionDep,
+) -> IncidentTimelineEntryResponse:
+    return SafetyService(session).append_action(incident_id, data)
+
+
+@router.post(
+    "/incidents/{incident_id}/timeline/status-suggestions",
+    response_model=IncidentTimelineEntryResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def append_status_suggestion(
+    incident_id: int,
+    data: StatusSuggestionAppend,
+    session: SessionDep,
+) -> IncidentTimelineEntryResponse:
+    return SafetyService(session).append_status_suggestion(incident_id, data)
+
+
+@router.post(
+    "/incidents/{incident_id}/timeline/handovers",
+    response_model=IncidentTimelineEntryResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def append_handover(
+    incident_id: int,
+    data: HandoverAppend,
+    session: SessionDep,
+) -> IncidentTimelineEntryResponse:
+    return SafetyService(session).append_handover(incident_id, data)
+
+
+@router.get("/incidents/{incident_id}/timeline", response_model=IncidentTimelinePage)
+def incident_timeline(
+    incident_id: int,
+    session: SessionDep,
+    after_seq: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> IncidentTimelinePage:
+    return SafetyService(session).timeline(incident_id, after_seq=after_seq, limit=limit)
+
+
+@router.post(
+    "/incidents/{incident_id}/handovers/{entry_id}/confirm",
+    response_model=HandoverConfirmationResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def confirm_handover(
+    incident_id: int,
+    entry_id: int,
+    data: HandoverConfirm,
+    session: SessionDep,
+) -> HandoverConfirmationResponse:
+    return SafetyService(session).confirm_handover(incident_id, entry_id, data)
+
+
+@router.get("/handovers/pending", response_model=list[HandoverTodoItem])
+def pending_handovers(
+    session: SessionDep,
+    user_id: int = Query(gt=0),
+) -> list[HandoverTodoItem]:
+    return SafetyService(session).handover_todos(user_id)
+
+
+@router.post("/incidents/{incident_id}/transitions", response_model=EmergencyIncidentResponse)
+def transition_incident(
+    incident_id: int,
+    data: IncidentTransition,
     session: SessionDep,
 ) -> EmergencyIncidentResponse:
-    return SafetyService(session).update_incident(incident_id, data)
+    return SafetyService(session).transition_incident(incident_id, data)
 
 
 @router.post(
